@@ -9,6 +9,7 @@ import { RouterContext } from '../next-server/lib/router-context'
 import { isDynamicRoute } from '../next-server/lib/router/utils/is-dynamic'
 import * as envConfig from '../next-server/lib/runtime-config'
 import { getURL, loadGetInitialProps, ST } from '../next-server/lib/utils'
+import { delBasePath } from '../next-server/lib/router/router'
 import initHeadManager from './head-manager'
 import PageLoader from './page-loader'
 import measureWebVitals from './performance-relayer'
@@ -48,9 +49,21 @@ envConfig.setConfig({
   publicRuntimeConfig: runtimeConfig || {},
 })
 
-const asPath = getURL()
+let asPath = getURL()
 
-const pageLoader = new PageLoader(buildId, prefix)
+// make sure not to attempt stripping basePath for 404s
+if (
+  page !== '/404' &&
+  !(
+    page === '/_error' &&
+    hydrateProps &&
+    hydrateProps.pageProps.statusCode === '404'
+  )
+) {
+  asPath = delBasePath(asPath)
+}
+
+const pageLoader = new PageLoader(buildId, prefix, page)
 const register = ([r, f]) => pageLoader.registerPage(r, f)
 if (window.__NEXT_P) {
   // Defer page registration for another tick. This will increase the overall
@@ -60,7 +73,7 @@ if (window.__NEXT_P) {
 window.__NEXT_P = []
 window.__NEXT_P.push = register
 
-const updateHead = initHeadManager()
+const headManager = initHeadManager()
 const appElement = document.getElementById('__next')
 
 let lastAppProps
@@ -77,20 +90,6 @@ class Container extends React.Component {
 
   componentDidMount() {
     this.scrollToHash()
-
-    if (process.env.__NEXT_PLUGINS) {
-      // eslint-disable-next-line
-      import('next-plugin-loader?middleware=unstable-post-hydration!')
-        .then((mod) => {
-          return mod.default()
-        })
-        .catch((postHydrationErr) => {
-          console.error(
-            'Error calling post-hydration for plugins',
-            postHydrationErr
-          )
-        })
-    }
 
     // We need to replace the router state if:
     // - the page was (auto) exported and has a query string or search (hash)
@@ -170,7 +169,7 @@ export default async ({ webpackHMR: passedWebpackHMR } = {}) => {
   if (process.env.NODE_ENV === 'development') {
     webpackHMR = passedWebpackHMR
   }
-  const { page: app, mod } = await pageLoader.loadPageScript('/_app')
+  const { page: app, mod } = await pageLoader.loadPage('/_app')
   CachedApp = app
 
   if (mod && mod.reportWebVitals) {
@@ -488,7 +487,7 @@ function AppContainer({ children }) {
       }
     >
       <RouterContext.Provider value={makePublicRouterInstance(router)}>
-        <HeadManagerContext.Provider value={updateHead}>
+        <HeadManagerContext.Provider value={headManager}>
           {children}
         </HeadManagerContext.Provider>
       </RouterContext.Provider>

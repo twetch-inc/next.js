@@ -6,6 +6,13 @@ description: Learn to add and access environment variables in your Next.js appli
 
 > This document is for Next.js versions 9.4 and up. If you’re using an older version of Next.js, upgrade or refer to [Environment Variables in next.config.js](/docs/api-reference/next.config.js/environment-variables.md).
 
+<details open>
+  <summary><b>Examples</b></summary>
+  <ul>
+    <li><a href="https://github.com/vercel/next.js/tree/canary/examples/environment-variables">Environment Variables</a></li>
+  </ul>
+</details>
+
 Next.js comes with built-in support for environment variables, which allows you to do the following:
 
 - [Use `.env.local` to load environment variables](#loading-environment-variables)
@@ -43,7 +50,7 @@ export async function getStaticProps() {
 
 By default all environment variables loaded through `.env.local` are only available in the Node.js environment, meaning they won't be exposed to the browser.
 
-In order to expose a variable to the browser you can prefix the variable with `NEXT_PUBLIC_`. For example:
+In order to expose a variable to the browser you have to prefix the variable with `NEXT_PUBLIC_`. For example:
 
 ```bash
 NEXT_PUBLIC_ANALYTICS_ID=abcdefghijk

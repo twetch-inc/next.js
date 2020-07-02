@@ -11,9 +11,10 @@ import { UrlWithParsedQuery } from 'url'
 import Watchpack from 'watchpack'
 import { ampValidation } from '../build/output/index'
 import * as Log from '../build/output/log'
-import checkCustomRoutes from '../lib/check-custom-routes'
 import { PUBLIC_DIR_MIDDLEWARE_CONFLICT } from '../lib/constants'
+import { fileExists } from '../lib/file-exists'
 import { findPagesDir } from '../lib/find-pages-dir'
+import loadCustomRoutes, { CustomRoutes } from '../lib/load-custom-routes'
 import { verifyTypeScriptSetup } from '../lib/verifyTypeScriptSetup'
 import { PHASE_DEVELOPMENT_SERVER } from '../next-server/lib/constants'
 import {
@@ -31,6 +32,7 @@ import { Telemetry } from '../telemetry/storage'
 import HotReloader from './hot-reloader'
 import { findPageFile } from './lib/find-page-file'
 import { getNodeOptionsWithoutInspect } from './lib/utils'
+import { withCoalescedInvoke } from '../lib/coalesced-function'
 
 if (typeof React.Suspense === 'undefined') {
   throw new Error(
@@ -44,6 +46,9 @@ export default class DevServer extends Server {
   private webpackWatcher?: Watchpack | null
   private hotReloader?: HotReloader
   private isCustomServer: boolean
+  protected staticPathsWorker: import('jest-worker').default & {
+    loadStaticPaths: typeof import('./static-paths-worker').loadStaticPaths
+  }
 
   constructor(options: ServerConstructor & { isNextDevCommand?: boolean }) {
     super({ ...options, dev: true })
@@ -209,21 +214,6 @@ export default class DevServer extends Server {
               match: getRouteMatcher(getRouteRegex(page)),
             }))
 
-          const firstOptionalCatchAllPage =
-            this.dynamicRoutes.find((f) => /\[\[\.{3}[^\][/]*\]\]/.test(f.page))
-              ?.page ?? null
-          if (
-            this.nextConfig.experimental?.optionalCatchAll !== true &&
-            firstOptionalCatchAllPage
-          ) {
-            const msg = `Optional catch-all routes are currently experimental and cannot be used by default ("${firstOptionalCatchAllPage}").`
-            if (resolved) {
-              console.warn(msg)
-            } else {
-              throw new Error(msg)
-            }
-          }
-
           this.router.setDynamicRoutes(this.dynamicRoutes)
 
           if (!resolved) {
@@ -253,14 +243,13 @@ export default class DevServer extends Server {
 
   async prepare(): Promise<void> {
     await verifyTypeScriptSetup(this.dir, this.pagesDir!, false)
-    await this.loadCustomRoutes()
 
-    if (this.customRoutes) {
-      const { redirects, rewrites, headers } = this.customRoutes
+    this.customRoutes = await loadCustomRoutes(this.nextConfig)
 
-      if (redirects.length || rewrites.length || headers.length) {
-        this.router = new Router(this.generateRoutes())
-      }
+    // reload router
+    const { redirects, rewrites, headers } = this.customRoutes
+    if (redirects.length || rewrites.length || headers.length) {
+      this.router = new Router(this.generateRoutes())
     }
 
     this.hotReloader = new HotReloader(this.dir, {
@@ -350,10 +339,9 @@ export default class DevServer extends Server {
     const { pathname } = parsedUrl
 
     if (pathname!.startsWith('/_next')) {
-      try {
-        await fs.promises.stat(pathJoin(this.publicDir, '_next'))
+      if (await fileExists(pathJoin(this.publicDir, '_next'))) {
         throw new Error(PUBLIC_DIR_MIDDLEWARE_CONFLICT)
-      } catch (err) {}
+      }
     }
 
     const { finished } = (await this.hotReloader!.run(req, res, parsedUrl)) || {
@@ -367,8 +355,9 @@ export default class DevServer extends Server {
   }
 
   // override production loading of routes-manifest
-  protected getCustomRoutes() {
-    return this.customRoutes
+  protected getCustomRoutes(): CustomRoutes {
+    // actual routes will be loaded asynchronously during .prepare()
+    return { redirects: [], rewrites: [], headers: [] }
   }
 
   private _devCachedPreviewProps: __ApiPreviewProps | undefined
@@ -381,30 +370,6 @@ export default class DevServer extends Server {
       previewModeSigningKey: crypto.randomBytes(32).toString('hex'),
       previewModeEncryptionKey: crypto.randomBytes(32).toString('hex'),
     })
-  }
-
-  private async loadCustomRoutes(): Promise<void> {
-    const result = {
-      redirects: [],
-      rewrites: [],
-      headers: [],
-    }
-    const { redirects, rewrites, headers } = this.nextConfig.experimental
-
-    if (typeof redirects === 'function') {
-      result.redirects = await redirects()
-      checkCustomRoutes(result.redirects, 'redirect')
-    }
-    if (typeof rewrites === 'function') {
-      result.rewrites = await rewrites()
-      checkCustomRoutes(result.rewrites, 'rewrite')
-    }
-    if (typeof headers === 'function') {
-      result.headers = await headers()
-      checkCustomRoutes(result.headers, 'header')
-    }
-
-    this.customRoutes = result
   }
 
   generateRoutes() {
@@ -485,6 +450,30 @@ export default class DevServer extends Server {
     return !snippet.includes('data-amp-development-mode-only')
   }
 
+  protected async getStaticPaths(
+    pathname: string
+  ): Promise<{
+    staticPaths: string[] | undefined
+    hasStaticFallback: boolean
+  }> {
+    // we lazy load the staticPaths to prevent the user
+    // from waiting on them for the page to load in dev mode
+
+    const __getStaticPaths = async () => {
+      const paths = await this.staticPathsWorker.loadStaticPaths(
+        this.distDir,
+        pathname,
+        !this.renderOpts.dev && this._isLikeServerless
+      )
+      return paths
+    }
+    const { paths: staticPaths, fallback: hasStaticFallback } = (
+      await withCoalescedInvoke(__getStaticPaths)(`staticPaths-${pathname}`, [])
+    ).value
+
+    return { staticPaths, hasStaticFallback }
+  }
+
   protected async ensureApiPage(pathname: string) {
     return this.hotReloader!.ensurePage(pathname)
   }
@@ -495,6 +484,7 @@ export default class DevServer extends Server {
     pathname: string,
     query: { [key: string]: string }
   ): Promise<string | null> {
+    await this.devReady
     const compilationErr = await this.getCompilationError(pathname)
     if (compilationErr) {
       res.statusCode = 500
@@ -544,6 +534,7 @@ export default class DevServer extends Server {
     pathname: string,
     query: { [key: string]: string }
   ): Promise<string | null> {
+    await this.devReady
     if (res.statusCode === 404 && (await this.hasPage('/404'))) {
       await this.hotReloader!.ensurePage('/404')
     } else {
